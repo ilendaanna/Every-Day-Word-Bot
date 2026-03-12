@@ -1,12 +1,7 @@
 services:
   bot:
     build: .
+    env_file: .env
+    ports:
+      - "8000:8000"
     restart: always
-    environment:
-      - BOT_TOKEN=${BOT_TOKEN}
-    networks:
-      - dokploy-network
-
-networks:
-  dokploy-network:
-    external: true
