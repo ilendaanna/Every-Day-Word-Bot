@@ -64,6 +64,10 @@ async def view_dict(callback: types.CallbackQuery, db: AsyncSession):
     res = await db.execute(select(Dictionary).where(Dictionary.id == dict_id))
     d = res.scalars().first()
     
+    if not d:
+        await callback.answer("Dictionary not found.")
+        return
+        
     text = f"📂 *Dictionary:* {d.name}\nWords: {len(words)}"
     await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=get_dict_words_keyboard(words, dict_id))
     await callback.answer()
@@ -74,13 +78,18 @@ async def view_dict(callback: types.CallbackQuery, db: AsyncSession):
 async def save_word_step_1(callback: types.CallbackQuery, db: AsyncSession, state: FSMContext):
     word = callback.data.split(":")[1]
     
-    # Извлекаем определение из текста сообщения (оно там всегда после "📖 ")
-    msg_text = callback.message.text or callback.message.caption
+    # Пытаемся максимально надежно достать определение
+    msg_text = callback.message.text or callback.message.caption or ""
     definition = "No definition found"
-    if "📖 " in msg_text:
-        definition = msg_text.split("📖 ")[1].split("\n")[0]
+    
+    if "📖" in msg_text:
+        # Берем всё, что после значка книги
+        parts = msg_text.split("📖")
+        if len(parts) > 1:
+            definition = parts[1].strip()
+            # Убираем лишние кнопки или служебную инфу, если она была в конце
+            definition = definition.split("\n---")[0].strip()
 
-    # Сохраняем во временное состояние
     await state.update_data(word=word, definition=definition)
     
     dictionaries = await crud.get_dictionaries(db, callback.from_user.id)
@@ -98,19 +107,18 @@ async def save_word_step_2(callback: types.CallbackQuery, db: AsyncSession, stat
     data = callback.data.split(":")
     dict_id = int(data[2])
     
-    # Получаем данные из FSM
     user_data = await state.get_data()
     word = user_data.get("word")
-    definition = user_data.get("definition", "No definition")
+    definition = user_data.get("definition")
     
-    if not word:
-        # Fallback если FSM пуст (например после перезагрузки бота)
+    if not word or not definition or definition == "No definition found":
+        # Если FSM пуст, попробуем восстановить из текста (на всякий случай)
         word = data[1]
-        definition = "Definition not recovered"
+        definition = "Manual save (definition lost)"
 
     await crud.save_word_to_dict(db, callback.from_user.id, word, definition, dict_id)
     await state.clear()
-    await callback.message.edit_text(f"✅ Saved *{word.capitalize()}* with its definition!", parse_mode="Markdown")
+    await callback.message.edit_text(f"✅ Saved *{word.capitalize()}* to dictionary!", parse_mode="Markdown")
     await callback.answer()
 
 # --- FOLDER QUIZ LOGIC ---
@@ -121,7 +129,7 @@ async def start_dict_quiz(callback: types.CallbackQuery, db: AsyncSession):
     words = await crud.get_words_by_dict(db, dict_id)
     
     if len(words) < 2:
-        await callback.answer("Add at least 2 words to this folder to start a quiz!")
+        await callback.answer("Add at least 2 words to start a quiz!")
         return
         
     correct_obj = random.choice(words)
@@ -138,6 +146,7 @@ async def start_dict_quiz(callback: types.CallbackQuery, db: AsyncSession):
     options = distractor_pool[:3] + [correct_obj.word]
     random.shuffle(options)
     
+    # Используем сохраненное определение!
     text = f"📝 *Folder Quiz*\n\n📖 \"{correct_obj.definition}\"\n\n*Guess the word:*"
     await callback.message.edit_text(text, parse_mode="Markdown", 
                                    reply_markup=get_quiz_keyboard(options, correct_obj.word, dict_id))
