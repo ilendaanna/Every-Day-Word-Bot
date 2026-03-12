@@ -18,7 +18,8 @@ from app.db.models import SavedWord, Dictionary
 
 router = Router()
 
-class DictStates(StatesGroup):
+class WordStates(StatesGroup):
+    waiting_for_dict_selection = State()
     waiting_for_dict_name = State()
 
 @router.message(Command("start"))
@@ -47,9 +48,9 @@ async def view_dictionaries(event: types.Message | types.CallbackQuery, db: Asyn
 @router.message(F.text == "➕ Create Dictionary")
 async def cmd_create_dict(message: types.Message, state: FSMContext):
     await message.answer("Please enter a name for your new dictionary:")
-    await state.set_state(DictStates.waiting_for_dict_name)
+    await state.set_state(WordStates.waiting_for_dict_name)
 
-@router.message(DictStates.waiting_for_dict_name)
+@router.message(WordStates.waiting_for_dict_name)
 async def process_dict_creation(message: types.Message, state: FSMContext, db: AsyncSession):
     name = message.text
     await crud.create_dictionary(db, message.from_user.id, name)
@@ -67,11 +68,21 @@ async def view_dict(callback: types.CallbackQuery, db: AsyncSession):
     await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=get_dict_words_keyboard(words, dict_id))
     await callback.answer()
 
-# --- Word Saving ---
+# --- Word Saving Flow with FSM to keep definition ---
 
 @router.callback_query(F.data.startswith("save_step_1:"))
-async def save_word_step_1(callback: types.CallbackQuery, db: AsyncSession):
+async def save_word_step_1(callback: types.CallbackQuery, db: AsyncSession, state: FSMContext):
     word = callback.data.split(":")[1]
+    
+    # Извлекаем определение из текста сообщения (оно там всегда после "📖 ")
+    msg_text = callback.message.text or callback.message.caption
+    definition = "No definition found"
+    if "📖 " in msg_text:
+        definition = msg_text.split("📖 ")[1].split("\n")[0]
+
+    # Сохраняем во временное состояние
+    await state.update_data(word=word, definition=definition)
+    
     dictionaries = await crud.get_dictionaries(db, callback.from_user.id)
     if not dictionaries:
         await crud.create_dictionary(db, callback.from_user.id, "General")
@@ -83,13 +94,23 @@ async def save_word_step_1(callback: types.CallbackQuery, db: AsyncSession):
     await callback.answer()
 
 @router.callback_query(F.data.startswith("save_step_2:"))
-async def save_word_step_2(callback: types.CallbackQuery, db: AsyncSession, bot: Bot):
-    _, word, dict_id = callback.data.split(":")
+async def save_word_step_2(callback: types.CallbackQuery, db: AsyncSession, state: FSMContext):
+    data = callback.data.split(":")
+    dict_id = int(data[2])
     
-    # Try to find word in message history to get real definition
-    definition = "Saved from bot"
-    await crud.save_word_to_dict(db, callback.from_user.id, word, definition, int(dict_id))
-    await callback.message.edit_text(f"✅ Saved *{word.capitalize()}*!", parse_mode="Markdown")
+    # Получаем данные из FSM
+    user_data = await state.get_data()
+    word = user_data.get("word")
+    definition = user_data.get("definition", "No definition")
+    
+    if not word:
+        # Fallback если FSM пуст (например после перезагрузки бота)
+        word = data[1]
+        definition = "Definition not recovered"
+
+    await crud.save_word_to_dict(db, callback.from_user.id, word, definition, dict_id)
+    await state.clear()
+    await callback.message.edit_text(f"✅ Saved *{word.capitalize()}* with its definition!", parse_mode="Markdown")
     await callback.answer()
 
 # --- FOLDER QUIZ LOGIC ---
@@ -106,7 +127,6 @@ async def start_dict_quiz(callback: types.CallbackQuery, db: AsyncSession):
     correct_obj = random.choice(words)
     distractor_pool = [w.word for w in words if w.id != correct_obj.id]
     
-    # If not enough local distractors, get random words from API
     if len(distractor_pool) < 3:
         async with aiohttp.ClientSession() as session:
             async with session.get(f"https://random-word-api.herokuapp.com/word?number=5") as resp:
@@ -165,3 +185,23 @@ async def menu_quiz(event: types.Message | types.CallbackQuery):
         else:
             await event.message.edit_text(text, parse_mode="Markdown", reply_markup=get_quiz_keyboard(quiz["options"], quiz["correct"]))
             await event.answer()
+
+@router.callback_query(F.data.startswith("view_saved:"))
+async def callback_view_saved(callback: types.CallbackQuery, db: AsyncSession):
+    word_id = int(callback.data.split(":")[1])
+    res = await db.execute(select(SavedWord).where(SavedWord.id == word_id))
+    w = res.scalars().first()
+    if not w: return
+    text = f"🔖 *{w.word.capitalize()}*\n\n📖 {w.definition}"
+    await callback.message.edit_text(text, parse_mode="Markdown", 
+                                   reply_markup=get_saved_word_action_keyboard(w.id, w.dictionary_id))
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("remove_saved:"))
+async def callback_remove_saved(callback: types.CallbackQuery, db: AsyncSession):
+    _, word_id, dict_id = callback.data.split(":")
+    await crud.remove_saved_word(db, int(word_id))
+    await callback.answer("🗑️ Removed.")
+    # Return to dict view
+    words = await crud.get_words_by_dict(db, int(dict_id))
+    await callback.message.edit_text(f"Words in dictionary:", reply_markup=get_dict_words_keyboard(words, int(dict_id)))
