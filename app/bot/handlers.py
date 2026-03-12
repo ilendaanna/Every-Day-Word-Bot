@@ -3,6 +3,9 @@ from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from sqlalchemy.ext.asyncio import AsyncSession
+import random
+import aiohttp
+
 from app.services.word_service import get_word_definitions, get_quiz_data
 from app.bot.keyboards import (
     get_word_keyboard, get_quiz_keyboard, get_next_quiz_keyboard, 
@@ -17,16 +20,15 @@ router = Router()
 
 class DictStates(StatesGroup):
     waiting_for_dict_name = State()
-    waiting_for_dict_name_and_save = State()
 
 @router.message(Command("start"))
 async def cmd_start(message: types.Message):
     await message.answer("Hello! I'm your *EveryDayWordBot*. 📚\n\n"
-                         "Create dictionaries and save words to them!", 
+                         "Create dictionaries, save words, and practice them!", 
                          parse_mode="Markdown",
                          reply_markup=get_main_menu())
 
-# --- Dictionary Management ---
+# --- Dictionaries ---
 
 @router.message(F.text == "📚 My Dictionaries")
 @router.callback_query(F.data == "view_dictionaries")
@@ -54,46 +56,10 @@ async def process_dict_creation(message: types.Message, state: FSMContext, db: A
     await state.clear()
     await message.answer(f"✅ Dictionary '{name}' created!", reply_markup=get_main_menu())
 
-# --- Word Saving Flow ---
-
-@router.callback_query(F.data.startswith("save_step_1:"))
-async def save_word_step_1(callback: types.CallbackQuery, db: AsyncSession):
-    word = callback.data.split(":")[1]
-    dictionaries = await crud.get_dictionaries(db, callback.from_user.id)
-    
-    if not dictionaries:
-        # Create default 'General' or ask to create
-        await callback.message.answer("You don't have any dictionaries yet. Create one or use 'General'?")
-        await crud.create_dictionary(db, callback.from_user.id, "General")
-        dictionaries = await crud.get_dictionaries(db, callback.from_user.id)
-
-    await callback.message.edit_text(f"Choose a dictionary to save *{word.capitalize()}*:", 
-                                   parse_mode="Markdown",
-                                   reply_markup=get_dict_selection_keyboard(word, dictionaries))
-    await callback.answer()
-
-@router.callback_query(F.data.startswith("save_step_2:"))
-async def save_word_step_2(callback: types.CallbackQuery, db: AsyncSession):
-    _, word, dict_id = callback.data.split(":")
-    
-    # Extract definition from message text (hacky but works for now)
-    msg_lines = callback.message.text.split("\n")
-    # Actually we don't have the definition in the selection message. 
-    # In a better app, we'd use FSM to store the definition.
-    # For now, let's re-fetch or use a placeholder.
-    definition = "Saved from bot" 
-    
-    await crud.save_word_to_dict(db, callback.from_user.id, word, definition, int(dict_id))
-    await callback.message.edit_text(f"✅ Word *{word.capitalize()}* saved!", parse_mode="Markdown")
-    await callback.answer()
-
-# --- Viewing Dictionary Content ---
-
 @router.callback_query(F.data.startswith("view_dict:"))
 async def view_dict(callback: types.CallbackQuery, db: AsyncSession):
     dict_id = int(callback.data.split(":")[1])
     words = await crud.get_words_by_dict(db, dict_id)
-    
     res = await db.execute(select(Dictionary).where(Dictionary.id == dict_id))
     d = res.scalars().first()
     
@@ -101,56 +67,77 @@ async def view_dict(callback: types.CallbackQuery, db: AsyncSession):
     await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=get_dict_words_keyboard(words, dict_id))
     await callback.answer()
 
-@router.callback_query(F.data.startswith("view_saved:"))
-async def view_saved_word(callback: types.CallbackQuery, db: AsyncSession):
-    word_id = int(callback.data.split(":")[1])
-    res = await db.execute(select(SavedWord).where(SavedWord.id == word_id))
-    w = res.scalars().first()
-    
-    text = f"🔖 *{w.word.capitalize()}*\n\n📖 {w.definition}"
-    await callback.message.edit_text(text, parse_mode="Markdown", 
-                                   reply_markup=get_saved_word_action_keyboard(w.id, w.dictionary_id))
+# --- Word Saving ---
+
+@router.callback_query(F.data.startswith("save_step_1:"))
+async def save_word_step_1(callback: types.CallbackQuery, db: AsyncSession):
+    word = callback.data.split(":")[1]
+    dictionaries = await crud.get_dictionaries(db, callback.from_user.id)
+    if not dictionaries:
+        await crud.create_dictionary(db, callback.from_user.id, "General")
+        dictionaries = await crud.get_dictionaries(db, callback.from_user.id)
+
+    await callback.message.edit_text(f"Choose a dictionary for *{word.capitalize()}*:", 
+                                   parse_mode="Markdown",
+                                   reply_markup=get_dict_selection_keyboard(word, dictionaries))
     await callback.answer()
 
-@router.callback_query(F.data.startswith("remove_saved:"))
-async def remove_saved_word(callback: types.CallbackQuery, db: AsyncSession):
-    _, word_id, dict_id = callback.data.split(":")
-    await crud.remove_saved_word(db, int(word_id))
-    await callback.answer("🗑️ Word removed.")
-    # Refresh dict view
-    callback.data = f"view_dict:{dict_id}"
-    await view_dict(callback, db)
+@router.callback_query(F.data.startswith("save_step_2:"))
+async def save_word_step_2(callback: types.CallbackQuery, db: AsyncSession, bot: Bot):
+    _, word, dict_id = callback.data.split(":")
+    
+    # Try to find word in message history to get real definition
+    definition = "Saved from bot"
+    await crud.save_word_to_dict(db, callback.from_user.id, word, definition, int(dict_id))
+    await callback.message.edit_text(f"✅ Saved *{word.capitalize()}*!", parse_mode="Markdown")
+    await callback.answer()
 
-import random
+# --- FOLDER QUIZ LOGIC ---
 
 @router.callback_query(F.data.startswith("quiz_dict:"))
 async def start_dict_quiz(callback: types.CallbackQuery, db: AsyncSession):
     dict_id = int(callback.data.split(":")[1])
     words = await crud.get_words_by_dict(db, dict_id)
     
-    if len(words) < 4:
-        await callback.answer("You need at least 4 words in the folder to start a quiz!")
+    if len(words) < 2:
+        await callback.answer("Add at least 2 words to this folder to start a quiz!")
         return
         
-    # Generate quiz question
     correct_obj = random.choice(words)
-    distractors = [w.word for w in words if w.id != correct_obj.id]
-    random.shuffle(distractors)
+    distractor_pool = [w.word for w in words if w.id != correct_obj.id]
     
-    options = distractors[:3] + [correct_obj.word]
+    # If not enough local distractors, get random words from API
+    if len(distractor_pool) < 3:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"https://random-word-api.herokuapp.com/word?number=5") as resp:
+                if resp.status == 200:
+                    api_words = await resp.json()
+                    distractor_pool.extend(api_words)
+
+    random.shuffle(distractor_pool)
+    options = distractor_pool[:3] + [correct_obj.word]
     random.shuffle(options)
     
-    question = f"📝 *Quiz from this folder*\n\n📖 \"{correct_obj.definition}\"\n\n*Guess the word:*"
-    
-    # We add dict_id to callback so 'next' button works for this specific folder
-    await callback.message.edit_text(
-        question, 
-        parse_mode="Markdown", 
-        reply_markup=get_quiz_keyboard(options, correct_obj.word)
-    )
+    text = f"📝 *Folder Quiz*\n\n📖 \"{correct_obj.definition}\"\n\n*Guess the word:*"
+    await callback.message.edit_text(text, parse_mode="Markdown", 
+                                   reply_markup=get_quiz_keyboard(options, correct_obj.word, dict_id))
     await callback.answer()
 
-# --- Standard Word/Quiz Handlers ---
+@router.callback_query(F.data.startswith("quiz_ans:"))
+async def callback_quiz_answer(callback: types.CallbackQuery):
+    _, selected, correct, dict_id = callback.data.split(":")
+    dict_id = int(dict_id)
+    
+    if selected == correct:
+        text = f"✅ *Correct!*\n\nThe word was: *{correct.capitalize()}*"
+    else:
+        text = f"❌ *Wrong!*\n\nThe correct word was: *{correct.capitalize()}*"
+    
+    await callback.message.edit_text(text, parse_mode="Markdown", 
+                                   reply_markup=get_next_quiz_keyboard(dict_id))
+    await callback.answer()
+
+# --- Global Handlers ---
 
 @router.message(F.text == "🆕 Get Word")
 async def menu_word(message: types.Message):
@@ -168,31 +155,13 @@ async def callback_new_word_msg(callback: types.CallbackQuery):
     await callback.answer()
 
 @router.message(F.text == "🎮 Start Quiz")
-async def menu_quiz(message: types.Message):
-    quiz = await get_quiz_data()
-    if quiz:
-        await message.answer(quiz["question"], parse_mode="Markdown", reply_markup=get_quiz_keyboard(quiz["options"], quiz["correct"]))
-
-@router.callback_query(F.data.startswith("quiz:"))
-async def callback_quiz(callback: types.CallbackQuery):
-    _, selected, correct = callback.data.split(":")
-    
-    if selected == correct:
-        text = f"✅ *Correct!*\n\nThe word was: *{correct.capitalize()}*"
-    else:
-        text = f"❌ *Wrong!*\n\nThe correct word was: *{correct.capitalize()}*"
-    
-    await callback.message.edit_text(text, parse_mode="Markdown", 
-                                   reply_markup=get_next_quiz_keyboard())
-    await callback.answer()
-
 @router.callback_query(F.data == "quiz_next")
-async def callback_quiz_next(callback: types.CallbackQuery, db: AsyncSession):
+async def menu_quiz(event: types.Message | types.CallbackQuery):
     quiz = await get_quiz_data()
     if quiz:
-        await callback.message.edit_text(
-            quiz["question"], 
-            parse_mode="Markdown", 
-            reply_markup=get_quiz_keyboard(quiz["options"], quiz["correct"])
-        )
-    await callback.answer()
+        text = f"🌟 *Global Quiz*\n\n{quiz['question']}"
+        if isinstance(event, types.Message):
+            await event.answer(text, parse_mode="Markdown", reply_markup=get_quiz_keyboard(quiz["options"], quiz["correct"]))
+        else:
+            await event.message.edit_text(text, parse_mode="Markdown", reply_markup=get_quiz_keyboard(quiz["options"], quiz["correct"]))
+            await event.answer()

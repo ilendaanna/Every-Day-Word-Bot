@@ -32,7 +32,8 @@ def get_dictionaries_keyboard(dictionaries):
 
 def get_dict_words_keyboard(words, dict_id):
     builder = InlineKeyboardBuilder()
-    if len(words) >= 4:
+    # Квиз можно начать, если есть хотя бы 2 слова (остальные подмешаем)
+    if len(words) >= 2:
         builder.row(types.InlineKeyboardButton(text="📝 Start Quiz (this folder)", callback_data=f"quiz_dict:{dict_id}"))
     for w in words:
         builder.row(types.InlineKeyboardButton(text=f"📖 {w.word.capitalize()}", callback_data=f"view_saved:{w.id}"))
@@ -45,14 +46,22 @@ def get_saved_word_action_keyboard(word_id: int, dict_id: int):
     builder.row(types.InlineKeyboardButton(text="⬅️ Back to Dictionary", callback_data=f"view_dict:{dict_id}"))
     return builder.as_markup()
 
-def get_quiz_keyboard(options, correct_word):
+def get_quiz_keyboard(options, correct_word, dict_id: int = 0):
     builder = InlineKeyboardBuilder()
     for opt in options:
-        builder.add(types.InlineKeyboardButton(text=opt.capitalize(), callback_data=f"quiz:{opt}:{correct_word}"))
+        # Добавляем dict_id в callback, чтобы знать, какой это квиз
+        builder.add(types.InlineKeyboardButton(
+            text=opt.capitalize(), 
+            callback_data=f"quiz_ans:{opt}:{correct_word}:{dict_id}"
+        ))
     builder.adjust(2)
     return builder.as_markup()
 
-def get_next_quiz_keyboard():
+def get_next_quiz_keyboard(dict_id: int = 0):
     builder = InlineKeyboardBuilder()
-    builder.row(types.InlineKeyboardButton(text="➡️ Next Question", callback_data="quiz_next"))
+    # Если dict_id > 0, кнопка Next снова вызовет квиз по этой папке
+    cb = f"quiz_dict:{dict_id}" if dict_id > 0 else "quiz_next"
+    builder.row(types.InlineKeyboardButton(text="➡️ Next Question", callback_data=cb))
+    if dict_id > 0:
+        builder.row(types.InlineKeyboardButton(text="⬅️ Back to Folder", callback_data=f"view_dict:{dict_id}"))
     return builder.as_markup()
